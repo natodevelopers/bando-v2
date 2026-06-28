@@ -1,0 +1,6 @@
+{
+  "name": "Bando",
+  "description": "Bản đồ Việt Nam - Mapping application for Vietnam with classic and satellite views, Vietnamese local search, and routing.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
