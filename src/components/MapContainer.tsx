@@ -109,11 +109,10 @@ export default function MapContainer({
   const [isTrackingLocation, setIsTrackingLocation] = useState(false);
   const [is3DMode, setIs3DMode] = useState(false);
 
-  // Navigation Simulation and Active Status States
-  const [navigationCoords, setNavigationCoords] = useState<[number, number] | null>(null);
-  const [simulatedCoordIndex, setSimulatedCoordIndex] = useState(0);
-  const [isSimulating, setIsSimulating] = useState(true);
+  // Navigation Active States
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [gpsError, setGpsError] = useState<string | null>(null);
+  const [userHeading, setUserHeading] = useState<number | null>(null);
 
   // References for all active markers to easily remove them
   const selectedMarkerRef = useRef<maplibregl.Marker | null>(null);
@@ -693,24 +692,22 @@ export default function MapContainer({
     }
   }, [route, isMapLoaded]);
 
-  // A. Initialize and configure map when entering or leaving Navigation Mode
+  // A. Configure map camera when entering or leaving Navigation Mode
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !isMapLoaded) return;
 
     if (isNavigating && route?.geometry?.coordinates?.length) {
-      const startCoords = route.geometry.coordinates[0];
-      setNavigationCoords(startCoords);
-      setSimulatedCoordIndex(0);
       setCurrentStepIndex(0);
 
-      // Tilts, zooms, and paddings the camera for driving mode
+      // Camera driving perspective
+      const centerCoords = userLocation || route.geometry.coordinates[0];
       map.setPadding({ top: 80, bottom: 220, left: 0, right: 0 });
       map.easeTo({
-        center: startCoords,
+        center: centerCoords,
         zoom: 17,
         pitch: 55,
-        bearing: 0,
+        bearing: userHeading || 0,
         duration: 1200
       });
     } else {
@@ -725,50 +722,27 @@ export default function MapContainer({
     }
   }, [isNavigating, isMapLoaded, route]);
 
-  // B. Simulation Movement Interval (updates coordinates and bearing)
+  // B. Follow user's real-time position on map in Navigation Mode
   useEffect(() => {
-    if (!isNavigating || !isSimulating || !route?.geometry?.coordinates?.length) return;
+    const map = mapRef.current;
+    if (!map || !isMapLoaded || !isNavigating || !userLocation) return;
 
-    const coords = route.geometry.coordinates;
-    const interval = setInterval(() => {
-      setSimulatedCoordIndex((prevIndex) => {
-        const nextIndex = prevIndex + 1;
-        if (nextIndex >= coords.length) {
-          clearInterval(interval);
-          return prevIndex; // Stopped at destination
-        }
-
-        const prevCoord = coords[prevIndex];
-        const nextCoord = coords[nextIndex];
-        setNavigationCoords(nextCoord);
-
-        // Calculate heading to rotate the map facing forward
-        const heading = calculateHeading(prevCoord, nextCoord);
-        const map = mapRef.current;
-        if (map) {
-          map.easeTo({
-            center: nextCoord,
-            bearing: heading,
-            pitch: 55,
-            duration: 650, // smooth interpolation sliding
-            easing: (t) => t
-          });
-        }
-
-        return nextIndex;
-      });
-    }, 750);
-
-    return () => clearInterval(interval);
-  }, [isNavigating, isSimulating, route]);
+    map.easeTo({
+      center: userLocation,
+      bearing: userHeading || map.getBearing(),
+      pitch: 55,
+      zoom: 17,
+      duration: 1000
+    });
+  }, [userLocation, userHeading, isNavigating, isMapLoaded]);
 
   // C. Watch Orientation / Mobile Compass Heading
   useEffect(() => {
     if (!isNavigating) return;
 
     const handleOrientation = (e: DeviceOrientationEvent) => {
-      // If NOT simulating, use the real compass/gyro orientation to rotate map
-      if (!isSimulating && mapRef.current) {
+      // Use real compass/gyro orientation to rotate map if GPS heading is not actively moving/available
+      if (mapRef.current && !userHeading) {
         const heading = (e as any).webkitCompassHeading || e.alpha;
         if (heading !== undefined && heading !== null) {
           mapRef.current.easeTo({
@@ -783,64 +757,73 @@ export default function MapContainer({
     return () => {
       window.removeEventListener('deviceorientation', handleOrientation);
     };
-  }, [isNavigating, isSimulating]);
+  }, [isNavigating, userHeading]);
 
-  // D. Track/Advance Steps Progress and check Off-Route recalculation
+  // D. Track/Advance Steps Progress and check Off-Route recalculation based on real GPS
   useEffect(() => {
-    if (!isNavigating || !navigationCoords || !route) return;
+    if (!isNavigating || !userLocation || !route) return;
 
-    // 1. Advance steps
+    // 1. Advance step by step
     const currentStep = route.steps[currentStepIndex];
     if (currentStep) {
-      const distToManeuver = getHaversineDistance(navigationCoords, currentStep.maneuver.location);
-      if (distToManeuver < 25 && currentStepIndex < route.steps.length - 1) {
+      const distToManeuver = getHaversineDistance(userLocation, currentStep.maneuver.location);
+      if (distToManeuver < 30 && currentStepIndex < route.steps.length - 1) {
         setCurrentStepIndex((prev) => prev + 1);
       }
     }
 
-    // 2. Real GPS Off-Route verification
-    if (!isSimulating && userLocation) {
-      let minDist = Infinity;
-      for (const coord of route.geometry.coordinates) {
-        const d = getHaversineDistance(userLocation, coord);
-        if (d < minDist) minDist = d;
-      }
-
-      // If more than 60m off route, trigger OSRM recalculation callback
-      if (minDist > 60 && onCalculateRoute && route.endPlace) {
-        const virtualStart: GeocodingPlace = {
-          place_id: Math.random(),
-          licence: 'recalculated-gps',
-          osm_type: 'node',
-          osm_id: Math.random(),
-          lat: userLocation[1].toString(),
-          lon: userLocation[0].toString(),
-          display_name: `Vị trí của tôi (${userLocation[1].toFixed(5)}, ${userLocation[0].toFixed(5)})`,
-          boundingbox: [
-            (userLocation[1] - 0.01).toString(),
-            (userLocation[1] + 0.01).toString(),
-            (userLocation[0] - 0.01).toString(),
-            (userLocation[0] + 0.01).toString()
-          ]
-        };
-        onCalculateRoute(virtualStart, route.endPlace);
-      }
+    // 2. Real GPS Off-Route verification (more than 60m deviation)
+    let minDist = Infinity;
+    for (const coord of route.geometry.coordinates) {
+      const d = getHaversineDistance(userLocation, coord);
+      if (d < minDist) minDist = d;
     }
-  }, [isNavigating, navigationCoords, currentStepIndex, isSimulating, userLocation, route, onCalculateRoute]);
 
-  // 6. Watch real-time user GPS location
+    if (minDist > 60 && onCalculateRoute && route.endPlace) {
+      const virtualStart: GeocodingPlace = {
+        place_id: Math.random(),
+        licence: 'recalculated-gps',
+        osm_type: 'node',
+        osm_id: Math.random(),
+        lat: userLocation[1].toString(),
+        lon: userLocation[0].toString(),
+        display_name: `Vị trí của tôi (${userLocation[1].toFixed(5)}, ${userLocation[0].toFixed(5)})`,
+        boundingbox: [
+          (userLocation[1] - 0.01).toString(),
+          (userLocation[1] + 0.01).toString(),
+          (userLocation[0] - 0.01).toString(),
+          (userLocation[0] + 0.01).toString()
+        ]
+      };
+      onCalculateRoute(virtualStart, route.endPlace);
+    }
+  }, [isNavigating, userLocation, currentStepIndex, route, onCalculateRoute]);
+
+  // 6. Watch real-time user GPS location and handle permissions/status
   useEffect(() => {
-    if (!navigator.geolocation || !isMapLoaded) return;
+    if (!navigator.geolocation) {
+      setGpsError('Thiết bị hoặc trình duyệt của bạn không hỗ trợ định vị GPS.');
+      return;
+    }
 
     const watchId = navigator.geolocation.watchPosition(
       (position) => {
-        const { longitude, latitude } = position.coords;
+        const { longitude, latitude, heading } = position.coords;
         setUserLocation([longitude, latitude]);
+        if (heading !== null && heading !== undefined) {
+          setUserHeading(heading);
+        }
+        setGpsError(null);
       },
       (err) => {
         console.warn('Geolocation watch error:', err);
+        if (err.code === err.PERMISSION_DENIED) {
+          setGpsError('Yêu cầu quyền truy cập vị trí. Vui lòng cấp quyền trong cài đặt.');
+        } else {
+          setGpsError('Đang chờ tín hiệu GPS...');
+        }
       },
-      { enableHighAccuracy: true, maximumAge: 1000 }
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 }
     );
 
     return () => {
@@ -848,7 +831,7 @@ export default function MapContainer({
     };
   }, [isMapLoaded]);
 
-  // 7. Render and update the GPS blue dot marker
+  // 7. Render and update the GPS blue dot marker (100% real location only)
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !isMapLoaded) return;
@@ -858,10 +841,8 @@ export default function MapContainer({
       userLocationMarkerRef.current = null;
     }
 
-    const activeCoords = isNavigating ? navigationCoords : userLocation;
-
-    if (activeCoords) {
-      const [lon, lat] = activeCoords;
+    if (userLocation) {
+      const [lon, lat] = userLocation;
 
       // Create a custom pulsing blue dot element, made 3x bigger as requested
       const el = document.createElement('div');
@@ -884,7 +865,7 @@ export default function MapContainer({
         userLocationMarkerRef.current = null;
       }
     };
-  }, [userLocation, navigationCoords, isNavigating, isMapLoaded]);
+  }, [userLocation, isMapLoaded]);
 
   const handleGeolocate = () => {
     if (!navigator.geolocation) {
@@ -1130,10 +1111,10 @@ export default function MapContainer({
 
         const getRemainingStats = () => {
           const coords = route.geometry.coordinates;
-          const currentCoordIdx = isSimulating ? simulatedCoordIndex : getClosestCoordinateIndex(navigationCoords || userLocation || coords[0], coords);
+          const currentPos = userLocation || coords[0];
+          const currentCoordIdx = getClosestCoordinateIndex(currentPos, coords);
 
           let sumDist = 0;
-          const currentPos = navigationCoords || userLocation || coords[0];
           if (currentCoordIdx < coords.length - 1) {
             sumDist += getHaversineDistance(currentPos, coords[currentCoordIdx + 1]);
             for (let i = currentCoordIdx + 1; i < coords.length - 1; i++) {
@@ -1163,7 +1144,7 @@ export default function MapContainer({
 
         // Distance to upcoming step's maneuver
         const distToUpcomingManeuver = currentStep 
-          ? getHaversineDistance(navigationCoords || route.geometry.coordinates[0], currentStep.maneuver.location)
+          ? getHaversineDistance(userLocation || route.geometry.coordinates[0], currentStep.maneuver.location)
           : 0;
 
         return (
@@ -1220,39 +1201,22 @@ export default function MapContainer({
                 <span>Thoát</span>
               </button>
 
-              {/* Simulation Controls & Status */}
-              <div className="flex items-center space-x-2">
-                <button
-                  onClick={() => setIsSimulating(!isSimulating)}
-                  className={`p-2.5 rounded-xl border transition-all cursor-pointer ${
-                    isSimulating 
-                      ? 'bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-900/40 text-blue-600 dark:text-blue-400' 
-                      : 'bg-slate-50 dark:bg-slate-800/50 border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400'
-                  }`}
-                  title={isSimulating ? "Tạm dừng mô phỏng" : "Tiếp tục mô phỏng"}
-                >
-                  {isSimulating ? <Pause size={16} className="fill-current" /> : <Play size={16} className="fill-current" />}
-                </button>
-                <button
-                  onClick={() => {
-                    setSimulatedCoordIndex(0);
-                    setCurrentStepIndex(0);
-                    if (route?.geometry?.coordinates?.[0]) {
-                      setNavigationCoords(route.geometry.coordinates[0]);
-                      mapRef.current?.easeTo({
-                        center: route.geometry.coordinates[0],
-                        zoom: 17,
-                        pitch: 55,
-                        bearing: 0,
-                        duration: 800
-                      });
-                    }
-                  }}
-                  className="p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 transition-all cursor-pointer"
-                  title="Đặt lại mô phỏng"
-                >
-                  <RotateCcw size={16} />
-                </button>
+              {/* Real-time GPS Status Indicator */}
+              <div className="flex items-center space-x-2 bg-slate-50 dark:bg-slate-800/50 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800/80">
+                {gpsError ? (
+                  <div className="flex items-center space-x-1.5 text-amber-600 dark:text-amber-400">
+                    <AlertCircle size={14} className="animate-bounce" />
+                    <span className="text-[11px] font-semibold">{gpsError}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center space-x-1.5 text-emerald-600 dark:text-emerald-400">
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                    </span>
+                    <span className="text-[10px] font-bold uppercase tracking-wider">Định vị GPS thực tế</span>
+                  </div>
+                )}
               </div>
 
               {/* Navigation Status and Countdown (ETA / Dist) */}
